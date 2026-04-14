@@ -1,7 +1,7 @@
 # 端口扫描器 (Port Scanner)
 
 [![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 一个高性能、模块化的端口扫描工具，支持 IPv4/IPv6 双栈，支持代理，默认扫描常见高危端口。
 
@@ -215,7 +215,13 @@ IP 地址解析模块，支持：
 
 ## 📄 许可证
 
-本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
+本项目采用 Apache License 2.0 许可证 - 详见 [LICENSE](LICENSE) 文件
+
+简要说明：
+- 允许商业使用、修改、分发和专利使用
+- 需要保留版权和许可证声明
+- 修改的文件需要明确说明
+- 提供专利授权和免责条款
 
 ## ⚠️ 免责声明
 
