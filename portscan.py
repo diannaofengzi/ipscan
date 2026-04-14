@@ -319,6 +319,8 @@ async def async_scan_port(ip: str, port: int, ip_version: int = 4,
         # 根据 IP 版本创建对应的 socket
         if ip_version == 6:
             sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            # 设置 IPv6 选项，允许 IPv4 映射（如果需要）
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
         else:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         
@@ -330,19 +332,23 @@ async def async_scan_port(ip: str, port: int, ip_version: int = 4,
             addr_info = await loop.getaddrinfo(
                 ip, port, 
                 family=socket.AF_INET6, 
-                type=socket.SOCK_STREAM
+                type=socket.SOCK_STREAM,
+                proto=socket.IPPROTO_TCP
             )
             if not addr_info:
+                logger.debug(f"IPv6 地址解析失败：{ip}:{port}")
                 return False, "无法解析 IPv6 地址"
             
             # 连接到第一个匹配的地址
             _, _, _, _, sockaddr = addr_info[0]
+            logger.debug(f"IPv6 尝试连接：{sockaddr}")
             await asyncio.wait_for(
                 loop.sock_connect(sock, sockaddr),
                 timeout=timeout
             )
         else:
             # IPv4: 直接连接
+            logger.debug(f"IPv4 尝试连接：{ip}:{port}")
             await asyncio.wait_for(
                 loop.sock_connect(sock, (ip, port)),
                 timeout=timeout
@@ -350,14 +356,17 @@ async def async_scan_port(ip: str, port: int, ip_version: int = 4,
         
         # 连接成功，端口开放
         banner_str = "端口开放 (无横幅信息)"
+        logger.debug(f"端口开放：{ip}:{port}")
         return True, banner_str
             
     except asyncio.TimeoutError:
+        logger.debug(f"连接超时：{ip}:{port}")
         return False, "超时"
     except OSError as e:
+        logger.debug(f"OS 错误 {ip}:{port}: {e}")
         return False, f"错误：{e}"
     except Exception as e:
-        logger.debug(f"扫描异常：{e}")
+        logger.debug(f"扫描异常 {ip}:{port}: {e}")
         return False, f"异常：{e}"
     finally:
         # 确保 socket 总是被关闭
@@ -975,8 +984,15 @@ def main():
                        help='代理服务器 URL (支持 socks4://, socks5://, http://, https://)')
     parser.add_argument('--test-proxy', action='store_true',
                        help='测试代理连接性后退出')
+    parser.add_argument('-d', '--debug', action='store_true',
+                       help='显示详细调试信息（包括 IPv6 连接详情）')
 
     args = parser.parse_args()
+    
+    # 配置调试模式
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        print("🔍 调试模式已启用")
 
     # 配置代理
     if args.proxy:
