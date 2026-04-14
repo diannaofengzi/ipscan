@@ -113,6 +113,72 @@ class RateLimiter:
         self.last_time = asyncio.get_event_loop().time()
 
 
+def parse_port_list(port_str: str) -> List[int]:
+    """
+    解析端口列表字符串，支持多种格式：
+    - 单个端口：80
+    - 逗号分隔：22,80,443
+    - 端口范围：50-65535
+    - 混合模式：22,80,443,1000-2000
+    - all: 所有端口 (1-65535)
+    
+    返回：排序后的端口列表
+    """
+    if not port_str:
+        return []
+    
+    port_str = port_str.strip().lower()
+    
+    # 处理 'all' 特殊情况
+    if port_str == 'all':
+        return list(range(1, 65536))
+    
+    ports = set()
+    parts = port_str.split(',')
+    
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        
+        # 检查是否是范围格式 (x-y)
+        if '-' in part:
+            range_parts = part.split('-')
+            if len(range_parts) != 2:
+                raise ValueError(f"无效的端口范围格式：{part}")
+            
+            try:
+                start = int(range_parts[0].strip())
+                end = int(range_parts[1].strip())
+            except ValueError:
+                raise ValueError(f"无效的端口号：{part}")
+            
+            if start < 1 or start > 65535 or end < 1 or end > 65535:
+                raise ValueError(f"端口号必须在 1-65535 之间：{part}")
+            
+            if start > end:
+                raise ValueError(f"端口范围起始值不能大于结束值：{part}")
+            
+            for p in range(start, end + 1):
+                ports.add(p)
+        else:
+            # 单个端口
+            try:
+                port = int(part)
+            except ValueError:
+                raise ValueError(f"无效的端口号：{part}")
+            
+            if port < 1 or port > 65535:
+                raise ValueError(f"端口号必须在 1-65535 之间：{port}")
+            
+            ports.add(port)
+    
+    if not ports:
+        raise ValueError("没有指定有效的端口")
+    
+    return sorted(list(ports))
+
+
 def parse_ip_ranges(ip_ranges: List[str]) -> List[dict]:
     """
     解析 IP 地址范围，支持 CIDR 格式和单个 IP
@@ -841,8 +907,8 @@ def main():
                        help='显示详细扫描进度')
     parser.add_argument('--no-realtime', action='store_true',
                        help='禁用实时显示（仅在结束时显示报告）')
-    parser.add_argument('--ports', type=int, nargs='+',
-                       help=f'自定义扫描端口（默认：高危端口列表，共{len(HIGH_RISK_PORTS)}个）')
+    parser.add_argument('--ports', type=str, default=None,
+                       help=f'自定义扫描端口（默认：高危端口列表，共{len(HIGH_RISK_PORTS)}个）。支持格式：单个端口 (80)、逗号分隔 (22,80,443)、端口范围 (50-65535)、混合模式 (22,80,1000-2000)、all (所有端口 1-65535)')
     parser.add_argument('--sync', action='store_true',
                        help='使用同步模式（默认使用高性能异步模式）')
     parser.add_argument('--proxy', type=str, default=None,
@@ -883,9 +949,15 @@ def main():
         sys.exit(1)
 
     # 使用自定义端口或默认高危端口
-    ports = args.ports if args.ports else TARGET_PORTS
-    
-    if not args.ports:
+    if args.ports:
+        try:
+            ports = parse_port_list(args.ports)
+            print(f"🎯 扫描 {len(ports)} 个指定端口")
+        except ValueError as e:
+            print(f"❌ 端口参数错误：{e}")
+            sys.exit(1)
+    else:
+        ports = TARGET_PORTS
         print(f"🎯 默认扫描 {len(ports)} 个常见高危端口")
 
     # 执行扫描
