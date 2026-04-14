@@ -658,9 +658,7 @@ def _scan_network_threaded(ip_list: List[dict], ports: List[int], max_workers: i
     print(f"\n🎯 开始扫描 {total_ips} 个 IP 地址 (IPv4: {ipv4_count}, IPv6: {ipv6_count})")
     print(f"   目标端口：{format_port_display(ports)}")
     print(f"⚙️  线程数：{max_workers}, 超时时间：{timeout}s")
-    print(f"💡 按 Ctrl+C 可随时终止扫描")
-    if realtime:
-        print(f"📢 实时显示：发现开放端口立即显示\n")
+    print(f"💡 按 Ctrl+C 可随时终止扫描\n")
     
     results = []
     start_time = datetime.now()
@@ -668,12 +666,14 @@ def _scan_network_threaded(ip_list: List[dict], ports: List[int], max_workers: i
     # 设置信号处理器
     signal.signal(signal.SIGINT, signal_handler)
     
+    executor = None
     try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_ip = {executor.submit(scan_ip, ip_entry, ports, timeout): ip_entry 
-                           for ip_entry in ip_list}
-            
-            completed = 0
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        future_to_ip = {executor.submit(scan_ip, ip_entry, ports, timeout): ip_entry 
+                       for ip_entry in ip_list}
+        
+        completed = 0
+        try:
             for future in as_completed(future_to_ip):
                 # 检查是否请求关闭
                 if shutdown_requested:
@@ -707,12 +707,20 @@ def _scan_network_threaded(ip_list: List[dict], ports: List[int], max_workers: i
                 
                 except Exception as e:
                     print(f"❌ 扫描 {ip_entry['ip']} 时出错：{e}")
+        except KeyboardInterrupt:
+            print(f"\n⏹️  扫描被用户中断，已完成 {completed}/{total_ips} 个 IP")
+            shutdown_requested = True
     
     except Exception as e:
         print(f"❌ 扫描过程中出错：{e}")
     
-    # 重置信号处理器
-    signal.signal(signal.SIGINT, signal.default_int_handler)
+    finally:
+        # 清理线程池
+        if executor:
+            executor.shutdown(wait=False, cancel_futures=True)
+        
+        # 重置信号处理器
+        signal.signal(signal.SIGINT, signal.default_int_handler)
     
     elapsed = (datetime.now() - start_time).total_seconds()
     if elapsed > 0:
