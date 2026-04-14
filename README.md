@@ -17,11 +17,18 @@
 
 ### 核心功能
 - 🌐 **IPv4/IPv6 双栈支持** - 同时支持两种 IP 协议版本
-- 🔒 **代理支持** - SOCKS4/5, HTTP/HTTPS 代理
+- 🔒 **代理支持** - SOCKS4/5, HTTP/HTTPS 代理（纯 Python 实现，无需外部依赖）
 - ⚡ **高性能扫描** - 基于 asyncio 的异步架构
 - 🎯 **智能服务识别** - 自动识别常见服务和获取 banner
 - 📊 **实时结果显示** - 发现开放端口立即展示详细信息
 - 🛡️ **安全加固** - 输入验证、资源管理、速率限制
+
+### ✅ 最新修复
+1. **代理依赖问题** - 使用纯 Python 实现 SOCKS4/5 协议，不再需要 `socksio` 或 `PySocks`
+2. **IPv6 代理支持** - 完整支持 IPv6 地址通过 SOCKS5 和 HTTP CONNECT 代理
+   - SOCKS5: 支持 IPv4、IPv6 和域名地址
+   - HTTP CONNECT: 支持 IPv6 地址和域名
+   - SOCKS4: 仅支持 IPv4（协议限制）
 
 ### 默认扫描的高危端口
 | 端口 | 服务 | 风险等级 | 说明 |
@@ -42,15 +49,11 @@
 
 ### 环境要求
 - Python 3.7+
-- 无需额外依赖（基础功能）
+- 无需额外依赖（所有功能均为纯 Python 实现）
 
-### 可选依赖
-如需使用 SOCKS 代理，安装以下任一库：
-```bash
-pip install socksio
-# 或
-pip install PySocks
-```
+### ✅ 已修复的依赖问题
+旧版本需要安装 `socksio` 或 `PySocks` 才能使用代理功能。
+**新版本已完全重构代理模块，使用纯 Python 实现 SOCKS4/5 协议，无需任何外部依赖！**
 
 ### 克隆仓库
 ```bash
@@ -168,6 +171,8 @@ IP 地址解析模块，支持：
 3. **DoS 风险** - 限制 banner 接收数据量
 4. **异常处理** - 替换裸 except 子句
 5. **速率限制** - 添加扫描速率控制
+6. **代理依赖** - ✅ 新修复：纯 Python 实现 SOCKS 协议，无需外部库
+7. **IPv6 代理支持** - ✅ 新修复：完整支持 IPv6 地址通过代理连接
 
 详见 [SECURITY_AUDIT.md](SECURITY_AUDIT.md)
 
