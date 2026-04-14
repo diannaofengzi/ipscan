@@ -4,6 +4,7 @@
 端口扫描器 - 扫描 19890 和 18789 端口并识别服务类型
 支持手动输入地址段或读取地址列表文件
 支持 IPv4 和 IPv6 地址
+高性能优化版本：使用 asyncio + 连接池
 """
 
 import socket
@@ -11,13 +12,13 @@ import argparse
 import sys
 import signal
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Tuple, Optional, Union
+from typing import List, Tuple, Optional, Dict, Set
 import ipaddress
+import asyncio
+from collections import defaultdict
 
 # 全局标志用于控制优雅退出
 shutdown_requested = False
-executor_instance = None
 
 
 # 端口到服务名称的映射（常见服务）
@@ -111,7 +112,7 @@ def read_ip_file(filepath: str) -> List[dict]:
 
 def scan_port(ip: str, port: int, ip_version: int = 4, timeout: float = 2.0) -> Tuple[bool, Optional[str]]:
     """
-    扫描单个 IP 的单个端口
+    扫描单个 IP 的单个端口（同步版本，用于兼容性）
     支持 IPv4 和 IPv6
     返回：(是否开放，服务横幅信息)
     """
@@ -156,6 +157,48 @@ def scan_port(ip: str, port: int, ip_version: int = 4, timeout: float = 2.0) -> 
         return False, f"异常：{e}"
 
 
+async def async_scan_port(ip: str, port: int, ip_version: int = 4, 
+                          timeout: float = 2.0) -> Tuple[bool, Optional[str]]:
+    """
+    异步扫描单个 IP 的单个端口
+    支持 IPv4 和 IPv6
+    返回：(是否开放，服务横幅信息)
+    """
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                host=ip, 
+                port=port,
+                family=socket.AF_INET6 if ip_version == 6 else socket.AF_INET
+            ),
+            timeout=timeout
+        )
+        
+        # 端口开放，尝试获取服务横幅
+        try:
+            writer.write(b"GET / HTTP/1.0\r\n\r\n")
+            await writer.drain()
+            banner = await asyncio.wait_for(reader.read(1024), timeout=timeout)
+            banner_str = banner.decode('utf-8', errors='ignore')[:200]
+            writer.close()
+            await writer.wait_closed()
+            return True, banner_str if banner_str else "端口开放 (无横幅信息)"
+        except:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except:
+                pass
+            return True, "端口开放 (无法获取横幅)"
+            
+    except asyncio.TimeoutError:
+        return False, "超时"
+    except OSError as e:
+        return False, f"错误：{e}"
+    except Exception as e:
+        return False, f"异常：{e}"
+
+
 def identify_service(port: int, banner: str) -> dict:
     """
     根据端口和横幅识别服务类型
@@ -190,7 +233,7 @@ def identify_service(port: int, banner: str) -> dict:
 
 def scan_ip(ip_entry: dict, ports: List[int], timeout: float = 2.0) -> dict:
     """
-    扫描单个 IP 的所有目标端口
+    扫描单个 IP 的所有目标端口（同步版本）
     ip_entry: {'ip': str, 'version': 4|6}
     """
     ip = ip_entry['ip']
@@ -217,17 +260,238 @@ def scan_ip(ip_entry: dict, ports: List[int], timeout: float = 2.0) -> dict:
     return results
 
 
+async def async_scan_ip(ip_entry: dict, ports: List[int], 
+                        timeout: float = 2.0, semaphore: asyncio.Semaphore = None) -> dict:
+    """
+    异步扫描单个 IP 的所有目标端口
+    ip_entry: {'ip': str, 'version': 4|6}
+    semaphore: 用于限制并发连接数
+    """
+    ip = ip_entry['ip']
+    ip_version = ip_entry['version']
+    
+    results = {
+        'ip': ip,
+        'ip_version': ip_version,
+        'open_ports': [],
+        'closed_ports': [],
+        'services': {}
+    }
+    
+    # 如果提供了信号量，则使用它来限制并发
+    async with semaphore if semaphore else asyncio.Lock():
+        # 并行扫描所有端口
+        tasks = [async_scan_port(ip, port, ip_version, timeout) for port in ports]
+        port_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for port, result in zip(ports, port_results):
+            if isinstance(result, Exception):
+                results['closed_ports'].append(port)
+            else:
+                is_open, banner = result
+                if is_open:
+                    results['open_ports'].append(port)
+                    service_info = identify_service(port, banner)
+                    results['services'][port] = service_info
+                else:
+                    results['closed_ports'].append(port)
+    
+    return results
+
+
 def signal_handler(signum, frame):
     """
     处理 Ctrl+C 信号
     """
-    global shutdown_requested, executor_instance
+    global shutdown_requested
     print("\n\n⚠️  检测到 Ctrl+C，正在停止扫描...")
     shutdown_requested = True
+
+
+async def async_scan_network(ip_list: List[dict], ports: List[int], 
+                             max_workers: int = 100, timeout: float = 2.0,
+                             realtime: bool = True) -> List[dict]:
+    """
+    异步批量扫描 IP 列表 - 高性能版本
+    使用 asyncio 实现高并发
     
-    # 关闭线程池
-    if executor_instance:
-        executor_instance.shutdown(wait=False, cancel_futures=True)
+    参数:
+        ip_list: [{'ip': str, 'version': 4|6}, ...]
+        max_workers: 最大并发数（默认 100，比线程池更高）
+        realtime: 是否实时显示发现的开放端口
+    """
+    global shutdown_requested
+    
+    total_ips = len(ip_list)
+    ipv4_count = sum(1 for ip in ip_list if ip['version'] == 4)
+    ipv6_count = sum(1 for ip in ip_list if ip['version'] == 6)
+    
+    print(f"\n🎯 开始异步扫描 {total_ips} 个 IP 地址 (IPv4: {ipv4_count}, IPv6: {ipv6_count})")
+    print(f"   目标端口：{ports}")
+    print(f"⚙️  最大并发数：{max_workers}, 超时时间：{timeout}s")
+    print(f"💡 按 Ctrl+C 可随时终止扫描")
+    if realtime:
+        print(f"📢 实时显示：发现开放端口立即显示\n")
+    
+    results = []
+    start_time = datetime.now()
+    completed = 0
+    
+    # 创建信号量限制并发数
+    semaphore = asyncio.Semaphore(max_workers)
+    
+    async def scan_with_progress(ip_entry, idx):
+        nonlocal completed
+        if shutdown_requested:
+            return None
+        
+        result = await async_scan_ip(ip_entry, ports, timeout, semaphore)
+        completed += 1
+        
+        # 实时显示结果
+        if realtime and result['open_ports']:
+            display_result(result, total_ips, completed)
+        
+        # 进度显示
+        if completed % 100 == 0 or completed == total_ips:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            rate = completed / elapsed if elapsed > 0 else 0
+            print(f"📊 进度：{completed}/{total_ips} "
+                  f"({rate:.1f} IP/s), "
+                  f"发现 {sum(1 for r in results if r['open_ports'])} "
+                  f"个开放端口的主机")
+        
+        return result
+    
+    try:
+        # 创建所有任务
+        tasks = [scan_with_progress(ip_entry, idx) for idx, ip_entry in enumerate(ip_list)]
+        
+        # 并发执行所有任务
+        for coro in asyncio.as_completed(tasks):
+            if shutdown_requested:
+                print(f"\n⏹️  扫描已终止，已完成 {completed}/{total_ips} 个 IP")
+                break
+            
+            result = await coro
+            if result:
+                results.append(result)
+    
+    except Exception as e:
+        print(f"❌ 扫描过程中出错：{e}")
+    
+    elapsed = (datetime.now() - start_time).total_seconds()
+    if elapsed > 0:
+        print(f"\n⏱️  扫描统计：耗时 {elapsed:.2f}秒，扫描 {len(results)} 个 IP，"
+              f"平均速度 {len(results)/elapsed:.1f} IP/s")
+        print(f"📍 发现 {sum(1 for r in results if r['open_ports'])} 个开放端口的主机")
+    
+    return results
+
+
+def scan_network(ip_list: List[dict], ports: List[int], max_workers: int = 50, 
+                 timeout: float = 2.0, verbose: bool = False, 
+                 realtime: bool = True, use_async: bool = True) -> List[dict]:
+    """
+    批量扫描 IP 列表（统一入口，支持同步和异步模式）
+    
+    参数:
+        ip_list: [{'ip': str, 'version': 4|6}, ...]
+        max_workers: 最大并发数
+        realtime: 是否实时显示发现的开放端口
+        use_async: 是否使用异步模式（默认 True，性能更好）
+    """
+    if use_async:
+        # 使用异步模式（推荐）
+        return asyncio.run(async_scan_network(
+            ip_list, ports, max_workers=max_workers, 
+            timeout=timeout, realtime=realtime
+        ))
+    else:
+        # 使用传统线程池模式（兼容旧版）
+        return _scan_network_threaded(ip_list, ports, max_workers, timeout, verbose, realtime)
+
+
+def _scan_network_threaded(ip_list: List[dict], ports: List[int], max_workers: int = 50, 
+                           timeout: float = 2.0, verbose: bool = False, 
+                           realtime: bool = True) -> List[dict]:
+    """
+    传统线程池扫描实现（向后兼容）
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    global shutdown_requested
+    
+    total_ips = len(ip_list)
+    ipv4_count = sum(1 for ip in ip_list if ip['version'] == 4)
+    ipv6_count = sum(1 for ip in ip_list if ip['version'] == 6)
+    
+    print(f"\n🎯 开始扫描 {total_ips} 个 IP 地址 (IPv4: {ipv4_count}, IPv6: {ipv6_count})")
+    print(f"   目标端口：{ports}")
+    print(f"⚙️  线程数：{max_workers}, 超时时间：{timeout}s")
+    print(f"💡 按 Ctrl+C 可随时终止扫描")
+    if realtime:
+        print(f"📢 实时显示：发现开放端口立即显示\n")
+    
+    results = []
+    start_time = datetime.now()
+    
+    # 设置信号处理器
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_ip = {executor.submit(scan_ip, ip_entry, ports, timeout): ip_entry 
+                           for ip_entry in ip_list}
+            
+            completed = 0
+            for future in as_completed(future_to_ip):
+                # 检查是否请求关闭
+                if shutdown_requested:
+                    print(f"\n⏹️  扫描已终止，已完成 {completed}/{total_ips} 个 IP")
+                    break
+                
+                ip_entry = future_to_ip[future]
+                completed += 1
+                
+                try:
+                    result = future.result()
+                    results.append(result)
+                    
+                    # 实时显示结果（默认开启）
+                    if realtime and result['open_ports']:
+                        display_result(result, total_ips, completed)
+                    elif verbose and result['open_ports']:
+                        # 兼容旧版 verbose 模式
+                        ip_version = result.get('ip_version', 4)
+                        print(f"[{completed}/{total_ips}] {result['ip']} (IPv{ip_version}): "
+                              f"开放端口 {result['open_ports']}")
+                    
+                    # 进度显示
+                    if completed % 100 == 0 or completed == total_ips:
+                        elapsed = (datetime.now() - start_time).total_seconds()
+                        rate = completed / elapsed if elapsed > 0 else 0
+                        print(f"📊 进度：{completed}/{total_ips} "
+                              f"({rate:.1f} IP/s), "
+                              f"发现 {sum(1 for r in results if r['open_ports'])} "
+                              f"个开放端口的主机")
+                
+                except Exception as e:
+                    print(f"❌ 扫描 {ip_entry['ip']} 时出错：{e}")
+    
+    except Exception as e:
+        print(f"❌ 扫描过程中出错：{e}")
+    
+    # 重置信号处理器
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    
+    elapsed = (datetime.now() - start_time).total_seconds()
+    if elapsed > 0:
+        print(f"\n⏱️  扫描统计：耗时 {elapsed:.2f}秒，扫描 {len(results)} 个 IP，"
+              f"平均速度 {len(results)/elapsed:.1f} IP/s")
+        print(f"📍 发现 {sum(1 for r in results if r['open_ports'])} 个开放端口的主机")
+    
+    return results
 
 
 def display_result(result: dict, total_ips: int, completed: int):
@@ -260,15 +524,37 @@ def display_result(result: dict, total_ips: int, completed: int):
 
 def scan_network(ip_list: List[dict], ports: List[int], max_workers: int = 50, 
                  timeout: float = 2.0, verbose: bool = False, 
-                 realtime: bool = True) -> List[dict]:
+                 realtime: bool = True, use_async: bool = True) -> List[dict]:
     """
-    批量扫描 IP 列表
+    批量扫描 IP 列表（统一入口，支持同步和异步模式）
     
     参数:
         ip_list: [{'ip': str, 'version': 4|6}, ...]
-        realtime: 是否实时显示发现的开放端口（默认 True）
+        max_workers: 最大并发数
+        realtime: 是否实时显示发现的开放端口
+        use_async: 是否使用异步模式（默认 True，性能更好）
     """
+    if use_async:
+        # 使用异步模式（推荐）
+        return asyncio.run(async_scan_network(
+            ip_list, ports, max_workers=max_workers, 
+            timeout=timeout, realtime=realtime
+        ))
+    else:
+        # 使用传统线程池模式（兼容旧版）
+        return _scan_network_threaded(ip_list, ports, max_workers, timeout, verbose, realtime)
+
+
+def _scan_network_threaded_old(ip_list: List[dict], ports: List[int], max_workers: int = 50, 
+                 timeout: float = 2.0, verbose: bool = False, 
+                 realtime: bool = True) -> List[dict]:
+    """
+    批量扫描 IP 列表（旧版本，保留用于兼容）
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
     global shutdown_requested, executor_instance
+    executor_instance = None
     
     total_ips = len(ip_list)
     ipv4_count = sum(1 for ip in ip_list if ip['version'] == 4)
@@ -445,6 +731,8 @@ def main():
                        help='禁用实时显示（仅在结束时显示报告）')
     parser.add_argument('--ports', type=int, nargs='+',
                        help=f'自定义扫描端口（默认：{TARGET_PORTS}）')
+    parser.add_argument('--sync', action='store_true',
+                       help='使用同步模式（默认使用高性能异步模式）')
     
     args = parser.parse_args()
     
@@ -468,7 +756,8 @@ def main():
         max_workers=args.threads,
         timeout=args.timeout,
         verbose=args.verbose,
-        realtime=not args.no_realtime
+        realtime=not args.no_realtime,
+        use_async=not args.sync
     )
     
     # 生成报告
