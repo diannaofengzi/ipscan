@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-端口扫描器 - 模块化设计
+端口扫描器 - 模块化重构版本
 支持 IPv4 和 IPv6 地址扫描
 支持代理（SOCKS4/5, HTTP/HTTPS）
 默认扫描常见高危端口
+
+⚠️  法律声明：本工具仅用于授权的安全测试和网络管理
+   未经授权使用本工具扫描他人网络可能违反法律法规
+
 高性能优化版本：使用 asyncio + 连接池
 """
 
@@ -13,8 +17,16 @@ import argparse
 import sys
 import signal
 from datetime import datetime
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 import asyncio
+import logging
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # 导入自定义模块
 from ip_parser import ParseIPv4, ParseIPv6, IPParser
@@ -22,6 +34,12 @@ from proxy_support import ProxyConfig, ProxySocket, ProxyType
 
 # 全局标志用于控制优雅退出
 shutdown_requested = False
+
+# 速率限制配置（防止网络拥塞和检测）
+RATE_LIMIT_CONFIG = {
+    'max_connections_per_second': 100,  # 每秒最大连接数
+    'delay_between_scans': 0.01,        # 扫描间隔（秒）
+}
 
 # 常见高危端口列表（默认扫描目标）
 HIGH_RISK_PORTS = [
@@ -74,6 +92,27 @@ TARGET_PORTS = HIGH_RISK_PORTS.copy()
 proxy_config: Optional[ProxyConfig] = None
 
 
+class RateLimiter:
+    """速率限制器，防止扫描过快导致网络问题"""
+    
+    def __init__(self, rate: float = 100.0):
+        """
+        初始化速率限制器
+        :param rate: 每秒允许的操作次数
+        """
+        self.rate = rate
+        self.min_interval = 1.0 / rate if rate > 0 else 0
+        self.last_time = 0.0
+    
+    async def acquire(self):
+        """异步等待直到可以执行下一次操作"""
+        now = asyncio.get_event_loop().time()
+        elapsed = now - self.last_time
+        if elapsed < self.min_interval:
+            await asyncio.sleep(self.min_interval - elapsed)
+        self.last_time = asyncio.get_event_loop().time()
+
+
 def parse_ip_ranges(ip_ranges: List[str]) -> List[dict]:
     """
     解析 IP 地址范围，支持 CIDR 格式和单个 IP
@@ -100,9 +139,25 @@ def scan_port(ip: str, port: int, ip_version: int = 4, timeout: float = 2.0) -> 
     扫描单个 IP 的单个端口（同步版本，用于兼容性）
     支持 IPv4、IPv6 和代理
     返回：(是否开放，服务横幅信息)
+    
+    ⚠️ 安全改进：
+    - 添加输入验证防止注入攻击
+    - 限制 banner 获取的数据量
+    - 确保 socket 正确关闭
     """
     global proxy_config
     
+    # 输入验证
+    if not isinstance(ip, str) or not ip:
+        return False, "无效的 IP 地址"
+    
+    if not isinstance(port, int) or port < 1 or port > 65535:
+        return False, f"无效的端口号：{port}"
+    
+    if not isinstance(timeout, (int, float)) or timeout <= 0:
+        return False, "无效的超时时间"
+    
+    sock = None
     try:
         # 如果配置了代理，使用代理连接
         if proxy_config and proxy_config.is_configured():
@@ -132,17 +187,15 @@ def scan_port(ip: str, port: int, ip_version: int = 4, timeout: float = 2.0) -> 
             result = 0
         
         if result == 0:
-            # 端口开放，尝试获取服务横幅
+            # 端口开放，尝试获取服务横幅（限制数据量防止 DoS）
             try:
+                sock.settimeout(1.0)  # 设置接收超时
                 sock.send(b"GET / HTTP/1.0\r\n\r\n")
-                banner = sock.recv(1024).decode('utf-8', errors='ignore')[:200]
-                sock.close()
+                banner = sock.recv(512).decode('utf-8', errors='ignore')[:200]
                 return True, banner if banner else "端口开放 (无横幅信息)"
-            except:
-                sock.close()
+            except Exception:
                 return True, "端口开放 (无法获取横幅)"
         else:
-            sock.close()
             return False, None
             
     except socket.timeout:
@@ -150,7 +203,15 @@ def scan_port(ip: str, port: int, ip_version: int = 4, timeout: float = 2.0) -> 
     except socket.error as e:
         return False, f"错误：{e}"
     except Exception as e:
-        return False, f"异常：{e}"
+        logger.debug(f"扫描异常：{e}")
+        return False, f"异常"
+    finally:
+        # 确保 socket 总是被关闭
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 async def async_scan_port(ip: str, port: int, ip_version: int = 4, 
