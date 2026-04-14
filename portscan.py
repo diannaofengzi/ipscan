@@ -16,6 +16,7 @@ import socket
 import argparse
 import sys
 import signal
+import csv
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict, Any
 import asyncio
@@ -860,9 +861,9 @@ def _scan_network_threaded_old(ip_list: List[dict], ports: List[int], max_worker
     return results
 
 
-def print_report(results: List[dict], output_file: Optional[str] = None, scanned_ports: List[int] = None):
+def print_report(results: List[dict], output_file: Optional[str] = None, scanned_ports: List[int] = None, csv_file: Optional[str] = None):
     """
-    生成扫描报告
+    生成扫描报告，支持导出 CSV 格式
     """
     # 筛选有开放端口的主机
     open_hosts = [r for r in results if r['open_ports']]
@@ -905,6 +906,39 @@ def print_report(results: List[dict], output_file: Optional[str] = None, scanned
     
     report_text = '\n'.join(report_lines)
     print(report_text)
+    
+    # 导出 CSV 文件
+    if csv_file:
+        try:
+            with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                # 写入表头
+                writer.writerow(['IP 地址', '端口', '状态', '协议', '服务/横幅'])
+                
+                # 遍历所有结果，写入开放端口
+                for result in results:
+                    ip = result['ip']
+                    ip_version = result.get('ip_version', 4)
+                    protocol = 'TCP'  # 默认 TCP
+                    
+                    # 写入开放端口
+                    for port in result['open_ports']:
+                        service = result['services'].get(port, {})
+                        service_name = service.get('name', 'Unknown')
+                        service_type = service.get('detected_type', '未知')
+                        banner = service.get('banner', '')
+                        service_info = f"{service_name} - {service_type}"
+                        if banner:
+                            service_info += f" | {banner[:100].replace(chr(10), ' ')}"
+                        
+                        writer.writerow([ip, port, 'open', protocol, service_info])
+                    
+                    # 可选：也记录关闭的端口（如果数量不多）
+                    # 如果端口数量太多，只记录开放端口
+            
+            print(f"\n💾 CSV 报告已保存到：{csv_file}")
+        except Exception as e:
+            print(f"❌ 保存 CSV 报告失败：{e}")
     
     # 输出到文件
     if output_file:
@@ -972,6 +1006,8 @@ def main():
                        help='连接超时时间（秒，默认：0.5）')
     parser.add_argument('-o', '--output',
                        help='输出报告文件路径')
+    parser.add_argument('--csv', type=str, default=None,
+                       help='导出扫描结果为 CSV 文件（标准 CSV 格式，包含 IP 地址、端口、状态、协议、服务/横幅）')
     parser.add_argument('-v', '--verbose', action='store_true',
                        help='显示详细扫描进度')
     parser.add_argument('--no-realtime', action='store_true',
@@ -1049,7 +1085,7 @@ def main():
     )
 
     # 生成报告
-    print_report(results, args.output, ports)
+    print_report(results, args.output, ports, args.csv)
 
 if __name__ == '__main__':
     main()
