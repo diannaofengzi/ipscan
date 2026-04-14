@@ -467,11 +467,13 @@ def scan_ip(ip_entry: dict, ports: List[int], timeout: float = 2.0) -> dict:
 
 
 async def async_scan_ip(ip_entry: dict, ports: List[int], 
-                        timeout: float = 2.0, semaphore: asyncio.Semaphore = None) -> dict:
+                        timeout: float = 2.0, semaphore: asyncio.Semaphore = None,
+                        port_semaphore: asyncio.Semaphore = None) -> dict:
     """
     异步扫描单个 IP 的所有目标端口
     ip_entry: {'ip': str, 'version': 4|6}
-    semaphore: 用于限制并发连接数
+    semaphore: 用于限制 IP 级别的并发（本函数不使用）
+    port_semaphore: 用于限制端口级别的并发（关键优化）
     """
     ip = ip_entry['ip']
     ip_version = ip_entry['version']
@@ -484,23 +486,32 @@ async def async_scan_ip(ip_entry: dict, ports: List[int],
         'services': {}
     }
     
-    # 如果提供了信号量，则使用它来限制并发
-    async with semaphore if semaphore else asyncio.Lock():
-        # 并行扫描所有端口
-        tasks = [async_scan_port(ip, port, ip_version, timeout) for port in ports]
-        port_results = await asyncio.gather(*tasks, return_exceptions=True)
+    # 如果提供了端口信号量，则使用它来限制端口扫描的并发
+    # 这是优化大量端口扫描的关键
+    if port_semaphore:
+        async def scan_single_port(port):
+            async with port_semaphore:
+                return await async_scan_port(ip, port, ip_version, timeout)
         
-        for port, result in zip(ports, port_results):
-            if isinstance(result, Exception):
-                results['closed_ports'].append(port)
+        tasks = [scan_single_port(port) for port in ports]
+    else:
+        # 没有限制，直接扫描（不推荐用于大量端口）
+        tasks = [async_scan_port(ip, port, ip_version, timeout) for port in ports]
+    
+    # 并行扫描所有端口
+    port_results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    for port, result in zip(ports, port_results):
+        if isinstance(result, Exception):
+            results['closed_ports'].append(port)
+        else:
+            is_open, banner = result
+            if is_open:
+                results['open_ports'].append(port)
+                service_info = identify_service(port, banner)
+                results['services'][port] = service_info
             else:
-                is_open, banner = result
-                if is_open:
-                    results['open_ports'].append(port)
-                    service_info = identify_service(port, banner)
-                    results['services'][port] = service_info
-                else:
-                    results['closed_ports'].append(port)
+                results['closed_ports'].append(port)
     
     return results
 
@@ -516,15 +527,16 @@ def signal_handler(signum, frame):
 
 async def async_scan_network(ip_list: List[dict], ports: List[int], 
                              max_workers: int = 100, timeout: float = 2.0,
-                             realtime: bool = True) -> List[dict]:
+                             realtime: bool = True, port_workers: int = None) -> List[dict]:
     """
     异步批量扫描 IP 列表 - 高性能版本
     使用 asyncio 实现高并发
     
     参数:
         ip_list: [{'ip': str, 'version': 4|6}, ...]
-        max_workers: 最大并发数（默认 100，比线程池更高）
+        max_workers: 最大并发 IP 数（默认 100，比线程池更高）
         realtime: 是否实时显示发现的开放端口
+        port_workers: 每个 IP 的端口扫描并发数（默认与 max_workers 相同，扫描 all 时建议设置更大值如 1000-3000）
     """
     global shutdown_requested
     
@@ -532,9 +544,17 @@ async def async_scan_network(ip_list: List[dict], ports: List[int],
     ipv4_count = sum(1 for ip in ip_list if ip['version'] == 4)
     ipv6_count = sum(1 for ip in ip_list if ip['version'] == 6)
     
+    # 自动优化端口并发数
+    if port_workers is None:
+        # 如果端口数量很大（如 all），自动增加端口并发数
+        if len(ports) > 1000:
+            port_workers = min(3000, max_workers * 10)  # 最多 3000 或 max_workers 的 10 倍
+        else:
+            port_workers = max_workers
+    
     print(f"\n🎯 开始异步扫描 {total_ips} 个 IP 地址 (IPv4: {ipv4_count}, IPv6: {ipv6_count})")
     print(f"   目标端口：{format_port_display(ports)}")
-    print(f"⚙️  最大并发数：{max_workers}, 超时时间：{timeout}s")
+    print(f"⚙️  最大并发 IP 数：{max_workers}, 端口并发数：{port_workers}, 超时时间：{timeout}s")
     print(f"💡 按 Ctrl+C 可随时终止扫描")
     if realtime:
         print(f"📢 实时显示：发现开放端口立即显示\n")
@@ -544,14 +564,15 @@ async def async_scan_network(ip_list: List[dict], ports: List[int],
     completed = 0
     
     # 创建信号量限制并发数
-    semaphore = asyncio.Semaphore(max_workers)
+    ip_semaphore = asyncio.Semaphore(max_workers)
+    port_semaphore = asyncio.Semaphore(port_workers)
     
     async def scan_with_progress(ip_entry, idx):
         nonlocal completed
         if shutdown_requested:
             return None
         
-        result = await async_scan_ip(ip_entry, ports, timeout, semaphore)
+        result = await async_scan_ip(ip_entry, ports, timeout, ip_semaphore, port_semaphore)
         completed += 1
         
         # 实时显示结果
@@ -597,7 +618,8 @@ async def async_scan_network(ip_list: List[dict], ports: List[int],
 
 def scan_network(ip_list: List[dict], ports: List[int], max_workers: int = 50, 
                  timeout: float = 2.0, verbose: bool = False, 
-                 realtime: bool = True, use_async: bool = True) -> List[dict]:
+                 realtime: bool = True, use_async: bool = True,
+                 port_workers: int = None) -> List[dict]:
     """
     批量扫描 IP 列表（统一入口，支持同步和异步模式）
     
@@ -606,12 +628,13 @@ def scan_network(ip_list: List[dict], ports: List[int], max_workers: int = 50,
         max_workers: 最大并发数
         realtime: 是否实时显示发现的开放端口
         use_async: 是否使用异步模式（默认 True，性能更好）
+        port_workers: 每个 IP 的端口扫描并发数（仅异步模式有效）
     """
     if use_async:
         # 使用异步模式（推荐）
         return asyncio.run(async_scan_network(
             ip_list, ports, max_workers=max_workers, 
-            timeout=timeout, realtime=realtime
+            timeout=timeout, realtime=realtime, port_workers=port_workers
         ))
     else:
         # 使用传统线程池模式（兼容旧版）
@@ -727,28 +750,6 @@ def display_result(result: dict, total_ips: int, completed: int):
         
         print(f"{'='*60}\n")
 
-
-def scan_network(ip_list: List[dict], ports: List[int], max_workers: int = 50, 
-                 timeout: float = 2.0, verbose: bool = False, 
-                 realtime: bool = True, use_async: bool = True) -> List[dict]:
-    """
-    批量扫描 IP 列表（统一入口，支持同步和异步模式）
-    
-    参数:
-        ip_list: [{'ip': str, 'version': 4|6}, ...]
-        max_workers: 最大并发数
-        realtime: 是否实时显示发现的开放端口
-        use_async: 是否使用异步模式（默认 True，性能更好）
-    """
-    if use_async:
-        # 使用异步模式（推荐）
-        return asyncio.run(async_scan_network(
-            ip_list, ports, max_workers=max_workers, 
-            timeout=timeout, realtime=realtime
-        ))
-    else:
-        # 使用传统线程池模式（兼容旧版）
-        return _scan_network_threaded(ip_list, ports, max_workers, timeout, verbose, realtime)
 
 
 def _scan_network_threaded_old(ip_list: List[dict], ports: List[int], max_workers: int = 50, 
@@ -942,7 +943,9 @@ def main():
                       help='包含 IP 地址列表的文件路径')
 
     parser.add_argument('-t', '--threads', type=int, default=100,
-                       help='并发线程数/协程数（默认：100）')
+                       help='并发线程数/协程数（默认：100，扫描 all 时建议增加到 500-1000）')
+    parser.add_argument('--port-threads', type=int, default=None,
+                       help='每个 IP 的端口扫描并发数（默认自动优化，扫描 all 时可手动设置为 1000-3000）')
     parser.add_argument('-T', '--timeout', type=float, default=0.5,
                        help='连接超时时间（秒，默认：0.5）')
     parser.add_argument('-o', '--output',
@@ -1012,7 +1015,8 @@ def main():
         timeout=args.timeout,
         verbose=args.verbose,
         realtime=not args.no_realtime,
-        use_async=not args.sync
+        use_async=not args.sync,
+        port_workers=args.port_threads
     )
 
     # 生成报告
