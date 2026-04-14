@@ -312,40 +312,44 @@ async def async_scan_port(ip: str, port: int, ip_version: int = 4,
     支持 IPv4 和 IPv6
     返回：(是否开放，服务横幅信息)
     """
-    reader = None
-    writer = None
     try:
-        # 使用更可靠的连接方式
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(
-                host=ip, 
-                port=port,
-                family=socket.AF_INET6 if ip_version == 6 else socket.AF_INET
-            ),
-            timeout=timeout
-        )
+        # 使用 asyncio.create_connection 来支持 IPv6
+        loop = asyncio.get_event_loop()
+        
+        # 根据 IP 版本选择连接方式
+        if ip_version == 6:
+            # IPv6: 直接使用 create_connection，它会自动处理地址格式
+            transport, protocol = await asyncio.wait_for(
+                loop.create_connection(
+                    lambda: asyncio.Protocol(),
+                    host=ip,
+                    port=port,
+                    family=socket.AF_INET6
+                ),
+                timeout=timeout
+            )
+        else:
+            # IPv4: 直接连接
+            transport, protocol = await asyncio.wait_for(
+                loop.create_connection(
+                    lambda: asyncio.Protocol(),
+                    host=ip,
+                    port=port,
+                    family=socket.AF_INET
+                ),
+                timeout=timeout
+            )
         
         # 连接成功，端口开放
-        # 尝试获取服务横幅（非必需，失败不影响结果）
-        banner_str = None
-        if writer:
-            try:
-                writer.write(b"GET / HTTP/1.0\r\n\r\n")
-                await asyncio.wait_for(writer.drain(), timeout=0.5)
-                banner = await asyncio.wait_for(reader.read(1024), timeout=0.5)
-                if banner:
-                    banner_str = banner.decode('utf-8', errors='ignore')[:200]
-            except:
-                # 横幅获取失败，但端口仍然是开放的
-                pass
-            
-            try:
-                writer.close()
-                await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
-            except:
-                pass
+        banner_str = "端口开放 (无横幅信息)"
         
-        return True, banner_str if banner_str else "端口开放 (无横幅信息)"
+        # 尝试关闭连接
+        try:
+            transport.close()
+        except:
+            pass
+        
+        return True, banner_str
             
     except asyncio.TimeoutError:
         return False, "超时"
@@ -354,13 +358,6 @@ async def async_scan_port(ip: str, port: int, ip_version: int = 4,
     except Exception as e:
         logger.debug(f"扫描异常：{e}")
         return False, f"异常：{e}"
-    finally:
-        # 确保资源清理
-        if writer and not writer.is_closing():
-            try:
-                writer.close()
-            except:
-                pass
 
 
 # 端口服务信息映射（常见高危端口）
