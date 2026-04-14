@@ -312,43 +312,44 @@ async def async_scan_port(ip: str, port: int, ip_version: int = 4,
     支持 IPv4 和 IPv6
     返回：(是否开放，服务横幅信息)
     """
+    loop = asyncio.get_event_loop()
+    sock = None
+    
     try:
-        # 使用 asyncio.create_connection 来支持 IPv6
-        loop = asyncio.get_event_loop()
-        
-        # 根据 IP 版本选择连接方式
+        # 根据 IP 版本创建对应的 socket
         if ip_version == 6:
-            # IPv6: 直接使用 create_connection，它会自动处理地址格式
-            transport, protocol = await asyncio.wait_for(
-                loop.create_connection(
-                    lambda: asyncio.Protocol(),
-                    host=ip,
-                    port=port,
-                    family=socket.AF_INET6
-                ),
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        else:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        
+        sock.setblocking(False)
+        
+        # 使用 asyncio 包装 socket 连接
+        if ip_version == 6:
+            # IPv6: 使用 getaddrinfo 获取正确的地址格式
+            addr_info = await loop.getaddrinfo(
+                ip, port, 
+                family=socket.AF_INET6, 
+                type=socket.SOCK_STREAM
+            )
+            if not addr_info:
+                return False, "无法解析 IPv6 地址"
+            
+            # 连接到第一个匹配的地址
+            _, _, _, _, sockaddr = addr_info[0]
+            await asyncio.wait_for(
+                loop.sock_connect(sock, sockaddr),
                 timeout=timeout
             )
         else:
             # IPv4: 直接连接
-            transport, protocol = await asyncio.wait_for(
-                loop.create_connection(
-                    lambda: asyncio.Protocol(),
-                    host=ip,
-                    port=port,
-                    family=socket.AF_INET
-                ),
+            await asyncio.wait_for(
+                loop.sock_connect(sock, (ip, port)),
                 timeout=timeout
             )
         
         # 连接成功，端口开放
         banner_str = "端口开放 (无横幅信息)"
-        
-        # 尝试关闭连接
-        try:
-            transport.close()
-        except:
-            pass
-        
         return True, banner_str
             
     except asyncio.TimeoutError:
@@ -358,6 +359,13 @@ async def async_scan_port(ip: str, port: int, ip_version: int = 4,
     except Exception as e:
         logger.debug(f"扫描异常：{e}")
         return False, f"异常：{e}"
+    finally:
+        # 确保 socket 总是被关闭
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 # 端口服务信息映射（常见高危端口）
