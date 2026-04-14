@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-端口扫描器 - 扫描 19890 和 18789 端口并识别服务类型
-支持手动输入地址段或读取地址列表文件
-支持 IPv4 和 IPv6 地址
+端口扫描器 - 模块化设计
+支持 IPv4 和 IPv6 地址扫描
+支持代理（SOCKS4/5, HTTP/HTTPS）
+默认扫描常见高危端口
 高性能优化版本：使用 asyncio + 连接池
 """
 
@@ -12,58 +13,75 @@ import argparse
 import sys
 import signal
 from datetime import datetime
-from typing import List, Tuple, Optional, Dict, Set
-import ipaddress
+from typing import List, Tuple, Optional, Dict
 import asyncio
-from collections import defaultdict
+
+# 导入自定义模块
+from ip_parser import ParseIPv4, ParseIPv6, IPParser
+from proxy_support import ProxyConfig, ProxySocket, ProxyType
 
 # 全局标志用于控制优雅退出
 shutdown_requested = False
 
+# 常见高危端口列表（默认扫描目标）
+HIGH_RISK_PORTS = [
+    # 远程管理服务
+    22,     # SSH
+    23,     # Telnet
+    3389,   # RDP
+    
+    # 数据库服务
+    1433,   # MSSQL
+    1521,   # Oracle
+    3306,   # MySQL
+    5432,   # PostgreSQL
+    6379,   # Redis (常未授权访问)
+    27017,  # MongoDB (常未授权访问)
+    
+    # Web 服务
+    80,     # HTTP
+    443,    # HTTPS
+    8080,   # HTTP Alt
+    8443,   # HTTPS Alt
+    
+    # 文件共享
+    21,     # FTP
+    445,    # SMB
+    139,    # NetBIOS
+    
+    # 邮件服务
+    25,     # SMTP
+    110,    # POP3
+    143,    # IMAP
+    
+    # 其他高危服务
+    135,    # RPC
+    5900,   # VNC
+    11211,  # Memcached
+    9200,   # Elasticsearch
+    9300,   # Elasticsearch Cluster
+    
+    # 原默认端口（保留）
+    19890,  # 自定义
+    18789,  # 自定义
+]
 
-# 端口到服务名称的映射（常见服务）
-KNOWN_SERVICES = {
-    19890: {
-        'name': 'Unknown/Custom',
-        'description': '非标准端口，可能是自定义应用',
-        'common_uses': ['自定义 Web 服务', '游戏服务器', '内部应用']
-    },
-    18789: {
-        'name': 'Unknown/Custom', 
-        'description': '非标准端口，可能是自定义应用',
-        'common_uses': ['自定义 API 服务', '代理服务器', '内部通信']
-    }
-}
+# 目标端口（可被命令行覆盖）
+TARGET_PORTS = HIGH_RISK_PORTS.copy()
 
-# 目标端口
-TARGET_PORTS = [19890, 18789]
+
+# 全局代理配置（在 main 中设置）
+proxy_config: Optional[ProxyConfig] = None
 
 
 def parse_ip_ranges(ip_ranges: List[str]) -> List[dict]:
     """
     解析 IP 地址范围，支持 CIDR 格式和单个 IP
     支持 IPv4 和 IPv6
+    使用模块化的 ParseIPv4 和 ParseIPv6
     返回：[{'ip': str, 'version': 4|6}, ...]
     """
-    ip_list = []
-    
-    for ip_range in ip_ranges:
-        try:
-            # 尝试解析为网络地址（CIDR 格式）
-            if '/' in ip_range:
-                network = ipaddress.ip_network(ip_range, strict=False)
-                version = 6 if isinstance(network, ipaddress.IPv6Network) else 4
-                ips = [{'ip': str(ip), 'version': version} for ip in network.hosts()]
-                ip_list.extend(ips)
-            else:
-                # 单个 IP 地址
-                ip_obj = ipaddress.ip_address(ip_range)
-                version = 6 if isinstance(ip_obj, ipaddress.IPv6Address) else 4
-                ip_list.append({'ip': ip_range, 'version': version})
-        except ValueError as e:
-            print(f"⚠️  无效的 IP 地址或网段：{ip_range} - {e}")
-    
-    return ip_list
+    return IPParser.parse_list(ip_ranges)
 
 
 def read_ip_file(filepath: str) -> List[dict]:
@@ -71,69 +89,47 @@ def read_ip_file(filepath: str) -> List[dict]:
     从文件读取 IP 地址列表
     支持格式：每行一个 IP 或网段，# 开头为注释
     支持 IPv4 和 IPv6
+    使用模块化的 IPParser
     返回：[{'ip': str, 'version': 4|6}, ...]
     """
-    ip_list = []
-    
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                # 跳过空行和注释
-                if not line or line.startswith('#'):
-                    continue
-                
-                try:
-                    # 尝试解析 IP 或网段
-                    if '/' in line:
-                        network = ipaddress.ip_network(line, strict=False)
-                        version = 6 if isinstance(network, ipaddress.IPv6Network) else 4
-                        ips = [{'ip': str(ip), 'version': version} for ip in network.hosts()]
-                        ip_list.extend(ips)
-                    else:
-                        ip_obj = ipaddress.ip_address(line)
-                        version = 6 if isinstance(ip_obj, ipaddress.IPv6Address) else 4
-                        ip_list.append({'ip': line, 'version': version})
-                except ValueError as e:
-                    print(f"⚠️  文件第{line_num}行无效：{line} - {e}")
-        
-        ipv4_count = sum(1 for ip in ip_list if ip['version'] == 4)
-        ipv6_count = sum(1 for ip in ip_list if ip['version'] == 6)
-        print(f"✓ 从文件读取 {len(ip_list)} 个 IP 地址 (IPv4: {ipv4_count}, IPv6: {ipv6_count})")
-        return ip_list
-    
-    except FileNotFoundError:
-        print(f"❌ 文件不存在：{filepath}")
-        return []
-    except Exception as e:
-        print(f"❌ 读取文件失败：{e}")
-        return []
+    return IPParser.from_file(filepath)
 
 
 def scan_port(ip: str, port: int, ip_version: int = 4, timeout: float = 2.0) -> Tuple[bool, Optional[str]]:
     """
     扫描单个 IP 的单个端口（同步版本，用于兼容性）
-    支持 IPv4 和 IPv6
+    支持 IPv4、IPv6 和代理
     返回：(是否开放，服务横幅信息)
     """
+    global proxy_config
+    
     try:
-        # 根据 IP 版本选择 socket 类型
-        if ip_version == 6:
-            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        # 如果配置了代理，使用代理连接
+        if proxy_config and proxy_config.is_configured():
+            proxy_socket = ProxySocket(proxy_config)
+            sock = proxy_socket.create_connection(ip, port, timeout, ip_version)
         else:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        
-        sock.settimeout(timeout)
-        
-        # IPv6 需要使用 getaddrinfo 来获取正确的地址格式
-        if ip_version == 6:
-            addr_info = socket.getaddrinfo(ip, port, socket.AF_INET6, socket.SOCK_STREAM)
-            if addr_info:
-                result = sock.connect_ex(addr_info[0][4])
+            # 根据 IP 版本选择 socket 类型
+            if ip_version == 6:
+                sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
             else:
-                return False, "无法解析地址"
-        else:
-            result = sock.connect_ex((ip, port))
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            
+            sock.settimeout(timeout)
+            
+            # IPv6 需要使用 getaddrinfo 来获取正确的地址格式
+            if ip_version == 6:
+                addr_info = socket.getaddrinfo(ip, port, socket.AF_INET6, socket.SOCK_STREAM)
+                if addr_info:
+                    result = sock.connect_ex(addr_info[0][4])
+                else:
+                    return False, "无法解析地址"
+            else:
+                result = sock.connect_ex((ip, port))
+        
+        if proxy_config and proxy_config.is_configured():
+            # 代理模式下，连接成功即为开放
+            result = 0
         
         if result == 0:
             # 端口开放，尝试获取服务横幅
@@ -199,6 +195,37 @@ async def async_scan_port(ip: str, port: int, ip_version: int = 4,
         return False, f"异常：{e}"
 
 
+# 端口服务信息映射（常见高危端口）
+KNOWN_SERVICES = {
+    22: {'name': 'SSH', 'description': 'Secure Shell 远程管理服务', 'common_uses': ['远程登录', '文件传输'], 'risk': '高'},
+    23: {'name': 'Telnet', 'description': '明文远程管理服务', 'common_uses': ['老旧设备管理'], 'risk': '极高'},
+    3389: {'name': 'RDP', 'description': '远程桌面协议', 'common_uses': ['Windows 远程桌面'], 'risk': '高'},
+    1433: {'name': 'MSSQL', 'description': 'Microsoft SQL Server', 'common_uses': ['数据库服务'], 'risk': '高'},
+    1521: {'name': 'Oracle', 'description': 'Oracle 数据库', 'common_uses': ['企业数据库'], 'risk': '高'},
+    3306: {'name': 'MySQL', 'description': 'MySQL 数据库', 'common_uses': ['Web 应用数据库'], 'risk': '高'},
+    5432: {'name': 'PostgreSQL', 'description': 'PostgreSQL 数据库', 'common_uses': ['Web 应用数据库'], 'risk': '高'},
+    6379: {'name': 'Redis', 'description': 'Redis 键值存储', 'common_uses': ['缓存', '消息队列'], 'risk': '高'},
+    27017: {'name': 'MongoDB', 'description': 'MongoDB 文档数据库', 'common_uses': ['NoSQL 数据库'], 'risk': '高'},
+    80: {'name': 'HTTP', 'description': '超文本传输协议', 'common_uses': ['Web 服务'], 'risk': '中'},
+    443: {'name': 'HTTPS', 'description': '加密的 HTTP 协议', 'common_uses': ['安全 Web 服务'], 'risk': '中'},
+    8080: {'name': 'HTTP-Alt', 'description': 'HTTP 备用端口', 'common_uses': ['代理', '开发服务器'], 'risk': '中'},
+    8443: {'name': 'HTTPS-Alt', 'description': 'HTTPS 备用端口', 'common_uses': ['管理界面'], 'risk': '中'},
+    21: {'name': 'FTP', 'description': '文件传输协议', 'common_uses': ['文件上传下载'], 'risk': '高'},
+    445: {'name': 'SMB', 'description': 'Server Message Block', 'common_uses': ['文件共享'], 'risk': '高'},
+    139: {'name': 'NetBIOS', 'description': 'NetBIOS Session Service', 'common_uses': ['Windows 网络'], 'risk': '高'},
+    25: {'name': 'SMTP', 'description': '简单邮件传输协议', 'common_uses': ['邮件发送'], 'risk': '中'},
+    110: {'name': 'POP3', 'description': '邮局协议 v3', 'common_uses': ['邮件接收'], 'risk': '中'},
+    143: {'name': 'IMAP', 'description': 'Internet 消息访问协议', 'common_uses': ['邮件管理'], 'risk': '中'},
+    135: {'name': 'RPC', 'description': '远程过程调用', 'common_uses': ['Windows RPC'], 'risk': '高'},
+    5900: {'name': 'VNC', 'description': '虚拟网络计算', 'common_uses': ['远程桌面'], 'risk': '高'},
+    11211: {'name': 'Memcached', 'description': '分布式内存缓存', 'common_uses': ['缓存服务'], 'risk': '高'},
+    9200: {'name': 'Elasticsearch', 'description': 'Elasticsearch HTTP API', 'common_uses': ['搜索引擎'], 'risk': '高'},
+    9300: {'name': 'ES-Cluster', 'description': 'Elasticsearch 集群通信', 'common_uses': ['集群节点通信'], 'risk': '高'},
+    19890: {'name': 'Custom', 'description': '自定义服务端口', 'common_uses': ['内部应用'], 'risk': '未知'},
+    18789: {'name': 'Custom', 'description': '自定义服务端口', 'common_uses': ['内部应用'], 'risk': '未知'},
+}
+
+
 def identify_service(port: int, banner: str) -> dict:
     """
     根据端口和横幅识别服务类型
@@ -206,7 +233,8 @@ def identify_service(port: int, banner: str) -> dict:
     service_info = KNOWN_SERVICES.get(port, {
         'name': 'Unknown',
         'description': '未知服务',
-        'common_uses': []
+        'common_uses': [],
+        'risk': '未知'
     }).copy()
     
     # 根据横幅内容进一步识别
@@ -221,9 +249,19 @@ def identify_service(port: int, banner: str) -> dict:
     elif 'smtp' in banner_lower:
         service_info['detected_type'] = '邮件服务'
     elif 'mysql' in banner_lower or 'mariadb' in banner_lower:
-        service_info['detected_type'] = '数据库服务'
+        service_info['detected_type'] = 'MySQL/MariaDB 数据库'
     elif 'redis' in banner_lower:
         service_info['detected_type'] = 'Redis 服务'
+    elif 'mongodb' in banner_lower:
+        service_info['detected_type'] = 'MongoDB 数据库'
+    elif 'postgresql' in banner_lower:
+        service_info['detected_type'] = 'PostgreSQL 数据库'
+    elif 'oracle' in banner_lower:
+        service_info['detected_type'] = 'Oracle 数据库'
+    elif 'microsoft sql' in banner_lower:
+        service_info['detected_type'] = 'MSSQL 数据库'
+    elif 'elasticsearch' in banner_lower:
+        service_info['detected_type'] = 'Elasticsearch 服务'
     else:
         service_info['detected_type'] = '自定义/未知服务'
     
@@ -685,84 +723,123 @@ def print_report(results: List[dict], output_file: Optional[str] = None):
 
 
 def main():
+    global proxy_config
+    
     parser = argparse.ArgumentParser(
-        description='端口扫描器 - 扫描 19890 和 18789 端口并识别服务类型 (支持 IPv4/IPv6)',
+        description='端口扫描器 - 模块化设计，支持 IPv4/IPv6，支持代理，默认扫描高危端口',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
 示例用法:
   # 扫描单个 IPv4 地址
-  python port_scanner.py -i 192.168.1.1
-  
+  python portscan.py -i 192.168.1.1
+
   # 扫描单个 IPv6 地址
-  python port_scanner.py -i 2001:db8::1
-  
+  python portscan.py -i 2001:db8::1
+
   # 扫描 IPv4 网段
-  python port_scanner.py -i 192.168.1.0/24
-  
+  python portscan.py -i 192.168.1.0/24
+
   # 扫描 IPv6 网段
-  python port_scanner.py -i 2001:db8::/64
-  
+  python portscan.py -i 2001:db8::/64
+
   # 混合扫描 IPv4 和 IPv6
-  python port_scanner.py -i 192.168.1.0/24 2001:db8::/64
-  
+  python portscan.py -i 192.168.1.0/24 2001:db8::/64
+
   # 从文件读取 IP 列表
-  python port_scanner.py -f ip_list.txt
-  
-  # 自定义参数
-  python port_scanner.py -i 10.0.0.0/8 -t 50 -o report.txt -v
+  python portscan.py -f ip_list.txt
+
+  # 使用代理扫描 (SOCKS5)
+  python portscan.py -i 192.168.1.0/24 --proxy socks5://127.0.0.1:1080
+
+  # 使用 HTTP 代理扫描
+  python portscan.py -i 192.168.1.0/24 --proxy http://proxy.example.com:8080
+
+  # 自定义端口扫描
+  python portscan.py -i 10.0.0.0/8 --ports 22 3306 6379
+
+  # 仅扫描常见高危端口（默认）
+  python portscan.py -i 192.168.1.0/24
+
+默认扫描的高危端口：{HIGH_RISK_PORTS[:10]}...等共{len(HIGH_RISK_PORTS)}个端口
         """
     )
-    
+
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('-i', '--ip', nargs='+', 
+    group.add_argument('-i', '--ip', nargs='+',
                       help='IP 地址或网段（CIDR 格式），可多个')
-    group.add_argument('-f', '--file', 
+    group.add_argument('-f', '--file',
                       help='包含 IP 地址列表的文件路径')
-    
-    parser.add_argument('-t', '--threads', type=int, default=50,
-                       help='并发线程数（默认：50）')
-    parser.add_argument('-T', '--timeout', type=float, default=2.0,
-                       help='连接超时时间（秒，默认：2.0）')
-    parser.add_argument('-o', '--output', 
+
+    parser.add_argument('-t', '--threads', type=int, default=100,
+                       help='并发线程数/协程数（默认：100）')
+    parser.add_argument('-T', '--timeout', type=float, default=0.5,
+                       help='连接超时时间（秒，默认：0.5）')
+    parser.add_argument('-o', '--output',
                        help='输出报告文件路径')
     parser.add_argument('-v', '--verbose', action='store_true',
                        help='显示详细扫描进度')
     parser.add_argument('--no-realtime', action='store_true',
                        help='禁用实时显示（仅在结束时显示报告）')
     parser.add_argument('--ports', type=int, nargs='+',
-                       help=f'自定义扫描端口（默认：{TARGET_PORTS}）')
+                       help=f'自定义扫描端口（默认：高危端口列表，共{len(HIGH_RISK_PORTS)}个）')
     parser.add_argument('--sync', action='store_true',
                        help='使用同步模式（默认使用高性能异步模式）')
-    
+    parser.add_argument('--proxy', type=str, default=None,
+                       help='代理服务器 URL (支持 socks4://, socks5://, http://, https://)')
+    parser.add_argument('--test-proxy', action='store_true',
+                       help='测试代理连接性后退出')
+
     args = parser.parse_args()
-    
+
+    # 配置代理
+    if args.proxy:
+        try:
+            proxy_config = ProxyConfig.from_url(args.proxy)
+            print(f"📡 使用代理：{proxy_config}")
+            
+            if args.test_proxy:
+                from proxy_support import test_proxy_connectivity
+                print("🔍 测试代理连接性...")
+                if test_proxy_connectivity(proxy_config):
+                    print("✅ 代理连接正常")
+                else:
+                    print("❌ 代理连接失败")
+                sys.exit(0)
+        except Exception as e:
+            print(f"❌ 代理配置错误：{e}")
+            sys.exit(1)
+    else:
+        proxy_config = None
+
     # 获取 IP 列表
     if args.ip:
         ip_list = parse_ip_ranges(args.ip)
     else:
         ip_list = read_ip_file(args.file)
-    
+
     if not ip_list:
         print("❌ 没有有效的 IP 地址可扫描")
         sys.exit(1)
-    
-    # 使用自定义端口或默认端口
+
+    # 使用自定义端口或默认高危端口
     ports = args.ports if args.ports else TARGET_PORTS
     
+    if not args.ports:
+        print(f"🎯 默认扫描 {len(ports)} 个常见高危端口")
+
     # 执行扫描
     results = scan_network(
-        ip_list, 
-        ports, 
+        ip_list,
+        ports,
         max_workers=args.threads,
         timeout=args.timeout,
         verbose=args.verbose,
         realtime=not args.no_realtime,
         use_async=not args.sync
     )
-    
+
     # 生成报告
     print_report(results, args.output)
-
 
 if __name__ == '__main__':
     main()
